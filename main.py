@@ -2,27 +2,20 @@ import os
 import json
 import tempfile
 import requests
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends, status
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
-from typing import List, Dict, Union
+from typing import List, Dict, Union, Any, Optional
 from dotenv import load_dotenv
-import tempfile
-
-import os
 import asyncio
 import httpx
 import time
 from urllib.parse import urlparse, unquote
 import uuid
-import json
-import re # Import re for regular expressions
-from typing import Optional, List, Dict, Any
-
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends # Added UploadFile, File, Form
-from pydantic import HttpUrl, BaseModel, Field, conint # Added conint for positive integers
+import re
 
 # Import LangChain Document and text splitter
-from langchain_core.documents import Document # Correct import for Document
+from langchain_core.documents import Document
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 
 from processing_utility import download_and_parse_document, extract_schema_from_file, initialize_llama_extract_agent
@@ -65,6 +58,14 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "NOT_FOUND")
 if GROQ_API_KEY == "NOT_FOUND":
     print("WARNING: GROQ_API_KEY is using a placeholder or hardcoded value. Please set GROQ_API_KEY environment variable for production.")
 
+# --- Authorization Token Setup ---
+# Set your authorization token as an environment variable.
+# For example, in your .env file: AUTHORIZATION_TOKEN="your_secret_token_here"
+EXPECTED_AUTH_TOKEN = os.getenv("AUTHORIZATION_TOKEN")
+if not EXPECTED_AUTH_TOKEN:
+    print("WARNING: AUTHORIZATION_TOKEN environment variable is not set. Authorization will not work as expected.")
+
+
 # --- Pydantic Models for Request and Response ---
 class RunRequest(BaseModel):
     documents: str  # URL to the PDF document
@@ -77,9 +78,28 @@ class RunResponse(BaseModel):
     answers: List[Answer]
     processing_time: float # Added to include the total processing time
 
+# --- Security Dependency ---
+security = HTTPBearer()
+
+async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    """
+    Verifies the Bearer token in the Authorization header.
+    """
+    if not EXPECTED_AUTH_TOKEN:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Authorization token not configured on the server."
+        )
+    if credentials.scheme != "Bearer" or credentials.credentials != EXPECTED_AUTH_TOKEN:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or missing authentication token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return True
+
 # --- Pseudo-functions (Replace with actual implementations if needed) ---
 
-# --- API Endpoint ---
 async def process_single_question(question: str, processed_documents: List[Dict[str, Any]], groq_api_key: str) -> Answer:
     """
     Processes a single question: performs vector search and generates an answer.
@@ -99,11 +119,15 @@ async def process_single_question(question: str, processed_documents: List[Dict[
     return Answer(answer=answer_text)
 
 @app.post("/hackrx/run", response_model=RunResponse)
-async def run_rag_pipeline(request: RunRequest):
+async def run_rag_pipeline(
+    request: RunRequest,
+    authorized: bool = Depends(verify_token) # Add this line to enforce authorization
+):
     """
     Runs the RAG pipeline for a given PDF document (converted to Markdown internally)
     and a list of questions, parallelizing the processing of each question.
     Uses a hybrid search method (BM25 + Dense Vectors).
+    Requires a valid Bearer token in the Authorization header.
     """
     pdf_url = request.documents
     questions = request.questions
@@ -170,6 +194,3 @@ async def run_rag_pipeline(request: RunRequest):
         if local_markdown_path and os.path.exists(local_markdown_path):
             os.unlink(local_markdown_path)
             print(f"Cleaned up temporary markdown file: {local_markdown_path}")
-
-
-
