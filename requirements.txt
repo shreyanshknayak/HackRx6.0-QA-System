@@ -9,7 +9,6 @@ langchain-text-splitters==0.3.9
 llama-cloud-services==0.6.53
 pydantic==2.11.7
 python-dotenv==1.1.1
-RAGatouille==0.0.9.post2
 transformers==4.49.0
 typing==3.7.4.3
 uvicorn==0.35.0
