@@ -14,15 +14,12 @@ from urllib.parse import urlparse, unquote
 import uuid
 import re
 
-# Import LangChain Document and text splitter
+#Import LangChain Document and text splitter
 from langchain_core.documents import Document
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 
-from processing_utility import download_and_parse_document, extract_schema_from_file, initialize_llama_extract_agent
-
-
-# Import functions and constants from the colbert_utils.py file
-# Make sure colbert_utils.py is in the same directory or accessible via PYTHONPATH
+# Assuming these are available in your environment
+from processing_utility import download_and_parse_document, extract_schema_from_file, initialize_llama_extract_agent, initialize_llama_parser
 from rag_utils import (
     process_markdown_with_manual_sections,
     perform_hybrid_search,
@@ -50,17 +47,16 @@ app = FastAPI(
 async def startup_event():
     load_embedding_model_at_startup() # From rag_utils
     initialize_llama_extract_agent() # From processing_utility
+    initialize_llama_parser() # From processing_utility
 
 
 # --- Groq API Key Setup ---
-# It's highly recommended to set this as an environment variable in production.
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "NOT_FOUND")
 if GROQ_API_KEY == "NOT_FOUND":
     print("WARNING: GROQ_API_KEY is using a placeholder or hardcoded value. Please set GROQ_API_KEY environment variable for production.")
 
 # --- Authorization Token Setup ---
 # Set your authorization token as an environment variable.
-# For example, in your .env file: AUTHORIZATION_TOKEN="your_secret_token_here"
 EXPECTED_AUTH_TOKEN = os.getenv("AUTHORIZATION_TOKEN")
 if not EXPECTED_AUTH_TOKEN:
     print("WARNING: AUTHORIZATION_TOKEN environment variable is not set. Authorization will not work as expected.")
@@ -76,7 +72,8 @@ class Answer(BaseModel):
 
 class RunResponse(BaseModel):
     answers: List[Answer]
-    processing_time: float # Added to include the total processing time
+    #processing_time: float
+    #step_timings: dict # New field for detailed timings
 
 # --- Security Dependency ---
 security = HTTPBearer()
@@ -98,63 +95,45 @@ async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(secur
         )
     return True
 
-# --- Pseudo-functions (Replace with actual implementations if needed) ---
-
-async def process_single_question(question: str, processed_documents: List[Dict[str, Any]], groq_api_key: str) -> Answer:
-    """
-    Processes a single question: performs vector search and generates an answer.
-    This function is designed to be run concurrently.
-    """
-    print(f"Starting processing for question: '{question}'")
-    # Perform vector search
-    retrieved_results = await perform_hybrid_search(question, TOP_K_CHUNKS)
-
-    if retrieved_results:
-        # Generate answer using Groq
-        answer_text = await generate_answer_with_groq(question, retrieved_results, GROQ_API_KEY)
-    else:
-        answer_text = "No relevant information found in the document to answer this question."
-
-    print(f"Finished processing for question: '{question}'")
-    return Answer(answer=answer_text)
 
 @app.post("/hackrx/run", response_model=RunResponse)
 async def run_rag_pipeline(
     request: RunRequest,
-    authorized: bool = Depends(verify_token) # Add this line to enforce authorization
+    authorized: bool = Depends(verify_token)
 ):
     """
     Runs the RAG pipeline for a given PDF document (converted to Markdown internally)
-    and a list of questions, parallelizing the processing of each question.
-    Uses a hybrid search method (BM25 + Dense Vectors).
-    Requires a valid Bearer token in the Authorization header.
+    and a list of questions.
     """
     pdf_url = request.documents
     questions = request.questions
+    local_markdown_path = None
+    step_timings = {}
 
-    local_markdown_path = None # Path to the temporary markdown file
+    start_time_total = time.perf_counter()
 
     try:
-        # Step 1: Download PDF and parse to Markdown
-        # This function should return the path to the converted markdown file
+        # 1. Parsing: Download PDF and parse to Markdown
+        start_time = time.perf_counter()
         markdown_content = await download_and_parse_document(pdf_url)
-
         with tempfile.NamedTemporaryFile(mode='w', delete=False, encoding='utf-8', suffix='.md') as temp_md_file:
             temp_md_file.write(markdown_content)
             local_markdown_path = temp_md_file.name
+        end_time = time.perf_counter()
+        step_timings["parsing_to_markdown"] = end_time - start_time
+        print(f"Parsing to Markdown took {step_timings['parsing_to_markdown']:.2f} seconds.")
 
-        # Step 2: Extract headings JSON from the markdown file
+        # 2. Headings Generation: Extract headings JSON
+        start_time = time.perf_counter()
         headings_json = extract_schema_from_file(local_markdown_path)
-        
-        # Optional: For debugging, write headings to output.json
-        with open("headings.json", 'w', encoding='utf-8') as f:
-            json.dump(headings_json, f, indent=4, ensure_ascii=False)
-
         if not headings_json or not headings_json.get("headings"):
             raise HTTPException(status_code=400, detail="Could not retrieve valid headings from the provided document.")
+        end_time = time.perf_counter()
+        step_timings["headings_generation"] = end_time - start_time
+        print(f"Headings Generation took {step_timings['headings_generation']:.2f} seconds.")
 
-        # Step 3: Process Markdown with manual sections to get chunks with metadata
-        print("Processing Markdown into chunks with manual sections...")
+        # 3. Chunk Generation: Process Markdown into chunks
+        start_time = time.perf_counter()
         processed_documents = process_markdown_with_manual_sections(
             local_markdown_path,
             headings_json,
@@ -163,26 +142,66 @@ async def run_rag_pipeline(
         )
         if not processed_documents:
             raise HTTPException(status_code=500, detail="Failed to process document into chunks.")
+        end_time = time.perf_counter()
+        step_timings["chunk_generation"] = end_time - start_time
+        print(f"Chunk Generation took {step_timings['chunk_generation']:.2f} seconds.")
+        
+        # 4. Model Initialization and Embeddings Pre-computation
+        start_time = time.perf_counter()
+        document_embeddings = initialize_hybrid_search_models(processed_documents)
+        end_time = time.perf_counter()
+        step_timings["model_initialization"] = end_time - start_time
+        print(f"Model initialization took {step_timings['model_initialization']:.2f} seconds.")
 
-        # Step 4: Initialize Hybrid Search Models (BM25 and Sentence Transformers)
-        # This must be done ONCE after processing all documents.
-        print("Initializing Hybrid Search models...")
-        initialize_hybrid_search_models(processed_documents)
-        print("Hybrid Search models initialized.")
+        # 5. Concurrent Query Processing (Search and Generation)
+        start_time_query_processing = time.perf_counter()
 
-        # Step 5: Parallelize question processing
-        print(f"Processing {len(questions)} questions in parallel...")
-        start_time = time.perf_counter() # Start timing
-        tasks = [
-            process_single_question(question, processed_documents, GROQ_API_KEY)
-            for question in questions
-        ]
-        all_answers = await asyncio.gather(*tasks)
-        end_time = time.perf_counter() # End timing
-        total_processing_time = end_time - start_time
+        # Search Phase
+        batch_size = 3
+        all_retrieved_results = []
+        print(f"Starting concurrent search in batches of {batch_size}...")
+        
+        for i in range(0, len(questions), batch_size):
+            current_batch_questions = questions[i:i + batch_size]
+            print(f"Processing batch {i//batch_size + 1} with {len(current_batch_questions)} queries.")
+            
+            search_tasks = [
+                asyncio.to_thread(perform_hybrid_search, question, TOP_K_CHUNKS, document_embeddings)
+                for question in current_batch_questions
+            ]
+            batch_results = await asyncio.gather(*search_tasks)
+            all_retrieved_results.extend(batch_results)
+            
+        print("Search phase completed for all queries.")
+        
+        # Generation Phase
+        print(f"Starting concurrent answer generation for {len(questions)} questions...")
+        generation_tasks = []
+        for question, retrieved_results in zip(questions, all_retrieved_results):
+            if retrieved_results:
+                generation_tasks.append(
+                    generate_answer_with_groq(question, retrieved_results, GROQ_API_KEY)
+                )
+            else:
+                no_info_future = asyncio.Future()
+                no_info_future.set_result("No relevant information found in the document to answer this question.")
+                generation_tasks.append(no_info_future)
+        
+        all_answer_texts = await asyncio.gather(*generation_tasks)
+        
+        end_time_query_processing = time.perf_counter()
+        step_timings["query_processing"] = end_time_query_processing - start_time_query_processing
+        print(f"Total query processing took {step_timings['query_processing']:.2f} seconds.")
+        
+        end_time_total = time.perf_counter()
+        total_processing_time = end_time_total - start_time_total
         print("All questions processed.")
+        
+        all_answers = [Answer(answer=answer_text) for answer_text in all_answer_texts]
 
-        return RunResponse(answers=all_answers, processing_time=total_processing_time)
+        return RunResponse(
+            answers=all_answers
+        )
 
     except HTTPException as e:
         raise e
@@ -190,7 +209,6 @@ async def run_rag_pipeline(
         print(f"An unhandled error occurred: {e}")
         raise HTTPException(status_code=500, detail=f"An internal server error occurred: {e}")
     finally:
-        # Clean up the temporary markdown file
         if local_markdown_path and os.path.exists(local_markdown_path):
             os.unlink(local_markdown_path)
             print(f"Cleaned up temporary markdown file: {local_markdown_path}")
