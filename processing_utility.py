@@ -3,15 +3,17 @@ import os         # To handle file paths and create directories.
 import asyncio    # To run synchronous libraries in an async environment.
 from urllib.parse import unquote, urlparse # To get the filename from the URL.
 import uuid       # To generate unique filenames if needed.
+import fitz
 
 from pydantic import HttpUrl
 from langchain_pymupdf4llm import PyMuPDF4LLMLoader
+import pymupdf4llm
 import json
 import re
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.schema import Document
 
-
+import tempfile
 import os
 import argparse
 from typing import Optional
@@ -20,12 +22,13 @@ from typing import Optional
 # You can install them using:
 # pip install llama_cloud_services pydantic python-dotenv
 
-from llama_cloud_services import LlamaExtract
+from llama_cloud_services import LlamaExtract, LlamaParse
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
 # Global variable for the extractor agent
 llama_extract_agent = None
+llama_parser = None
 
 
 class Insurance(BaseModel):
@@ -36,8 +39,30 @@ class Insurance(BaseModel):
     headings: str = Field(description="An array of headings")
 
 
-class Insurance(BaseModel):
-    headings: str = Field(description="An array of headings")
+def initialize_llama_parser() -> LlamaParse:
+    """
+    Initializes and returns a configured LlamaParse client.
+    This function should be called once at application startup.
+
+    Returns:
+        A LlamaParse instance ready for use.
+    """
+    global llama_parser
+    if llama_parser is None:
+        print("Initializing LlamaParse client")
+        api_key = os.environ.get("LLAMA_CLOUD_API_KEY")
+        if not api_key:
+            raise ValueError("LLAMA_CLOUD_API_KEY environment variable not set.")
+        
+        print("Initializing LlamaParse client...")
+        parser = LlamaParse(
+            api_key=api_key,
+            num_workers=4,
+            verbose=True,
+            language="en",
+        )
+        llama_parser = parser
+        print("LlamaParse client initialized.")
 
 def initialize_llama_extract_agent():
     global llama_extract_agent
@@ -85,21 +110,29 @@ def extract_schema_from_file(file_path: str) -> Optional[Insurance]:
 
 async def download_and_parse_document(doc_url: HttpUrl) -> str:
     """
-    Asynchronously downloads a document, saves it to a local directory,
-    and then parses it using LangChain's PyMuPDF4LLMLoader.
+    Asynchronously downloads a PDF document, saves it to a temporary file,
+    and then parses it using the provided LlamaParse API client.
 
     Args:
         doc_url: The Pydantic-validated URL of the document to process.
+        parser: An initialized LlamaParse client instance.
 
     Returns:
         A single string containing the document's content as structured Markdown.
     """
     print(f"Initiating download from: {doc_url}")
-    try:
-        # Create the local storage directory if it doesn't exist.
-        LOCAL_STORAGE_DIR = "data/"
-        os.makedirs(LOCAL_STORAGE_DIR, exist_ok=True)
 
+    temp_pdf_file_path = None
+
+    if llama_parser is None:
+        print("LlamaParse agent not initialized. Attempting to initialize now.")
+        initialize_llama_parser()
+        if llama_parser is None:
+            print("LlamaParse agent failed to initialize. Cannot proceed with extraction.")
+            return None
+    try:
+        # Step 1: Download the PDF file
+        
         async with httpx.AsyncClient() as client:
             response = await client.get(str(doc_url), timeout=30.0, follow_redirects=True)
             response.raise_for_status()
@@ -107,48 +140,30 @@ async def download_and_parse_document(doc_url: HttpUrl) -> str:
         doc_bytes = response.content
         print("Download successful.")
 
-        # --- Logic to determine the local filename ---
-        # Parse the URL to extract the path.
-        parsed_path = urlparse(str(doc_url)).path
-        # Get the last part of the path and decode URL-encoded characters (like %20 for space).
-        filename = unquote(os.path.basename(parsed_path))
+        # Step 2: Save the downloaded bytes to a temporary file
+        with tempfile.NamedTemporaryFile(mode='wb', delete=False, suffix='.pdf') as temp_file:
+            temp_file.write(doc_bytes)
+            temp_pdf_file_path = temp_file.name
         
-        # If the filename is empty, create a unique one.
-        if not filename:
-            filename = f"{uuid.uuid4()}.pdf"
-            
-        # Construct the full path where the file will be saved.
-        local_file_path = os.path.join(LOCAL_STORAGE_DIR, filename)
+        print(f"Document saved temporarily at: {temp_pdf_file_path}")
 
-        # Save the downloaded document to the local file.
-        with open(local_file_path, "wb") as f:
-            f.write(doc_bytes)
+        # Step 3: Parse the document using the provided LlamaParse client
+        print("Parsing document with LlamaParse...")
         
-        print(f"Document saved locally at: {local_file_path}")
-        print("Parsing document with LangChain's PyMuPDF4LLMLoader...")
-
-        # The loader's 'load' method is synchronous. Run it in a separate thread.
-        def load_document():
-            loader = PyMuPDF4LLMLoader(local_file_path)
-            documents = loader.load()
-            return documents
-
-        documents = await asyncio.to_thread(load_document)
+        # LlamaParse's aparse method takes a list of file paths
+        # and returns a list of LlamaParseResult objects.
+        results = await llama_parser.aparse([temp_pdf_file_path])
         
-        if documents:
-            parsed_markdown = "\n\n".join([doc.page_content for doc in documents])
-            print(f"Parsing complete. Extracted {len(parsed_markdown)} characters as Markdown.")
-            # The local file is NOT deleted, as requested.
-            '''with open("sample_schema.json", 'r') as file:
-                # Load the JSON data from the file into a Python variable (dictionary or list)
-                data_variable = json.load(file)'''
-
-            #await process_markdown_with_manual_sections(parsed_markdown, data_variable, chunk_size = 1000, chunk_overlap =200)
-            print(f"Markdown successfully saved to {filename}")
-            return parsed_markdown
-            return filename
-        else:
-            raise ValueError("PyMuPDF4LLMLoader did not return any content.")
+        if not results or not results[0].get_markdown_documents():
+            raise ValueError("LlamaParse did not return any content.")
+        
+        # Extract markdown from the result
+        markdown_documents = results[0].get_markdown_documents(split_by_page=True)
+        parsed_markdown = "\n\n".join([doc.text for doc in markdown_documents])
+        
+        print(f"Parsing complete. Extracted {len(parsed_markdown)} characters as Markdown.")
+        
+        return parsed_markdown
 
     except httpx.HTTPStatusError as e:
         print(f"Error downloading document: {e}")
@@ -156,3 +171,10 @@ async def download_and_parse_document(doc_url: HttpUrl) -> str:
     except Exception as e:
         print(f"Error during processing: {e}")
         raise
+    finally:
+        # Step 4: Clean up the temporary file
+        if temp_pdf_file_path and os.path.exists(temp_pdf_file_path):
+            os.unlink(temp_pdf_file_path)
+            print(f"Cleaned up temporary PDF file: {temp_pdf_file_path}")
+
+
